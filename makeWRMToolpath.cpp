@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <iomanip>
 
 struct Point {
     float x, y, z;
@@ -168,6 +169,174 @@ void printBoundingBox(const std::vector<Triangle>& triangles) {
     std::cout << "  Z: " << zmin << " to " << zmax << "  (" << (zmax-zmin) << " in)" << std::endl;
 }
 
+// --- Toolpath tracing -----------------------------------------------------
+
+struct Toolpath {
+    std::vector<Point> pts;
+};
+
+// Precomputed interpolation data for the offset surface
+struct TraceData {
+    const Grid* grid;
+    std::vector<std::vector<float>> surfZ;  // offset surface Z at each grid point
+    std::vector<std::vector<float>> gx;     // dZ/dX on offset surface
+    std::vector<std::vector<float>> gy;     // dZ/dY on offset surface
+};
+
+TraceData buildTraceData(const Grid& grid, const Surface& surf) {
+    int nr = surf.rows, nc = surf.cols;
+    TraceData td;
+    td.grid = &grid;
+    td.surfZ.assign(nr, std::vector<float>(nc));
+    td.gx.assign(nr, std::vector<float>(nc, 0.0f));
+    td.gy.assign(nr, std::vector<float>(nc, 0.0f));
+
+    for (int r = 0; r < nr; ++r)
+        for (int c = 0; c < nc; ++c)
+            td.surfZ[r][c] = surf.pts[r][c].z;
+
+    for (int r = 0; r < nr; ++r) {
+        for (int c = 0; c < nc; ++c) {
+            if (c == 0)
+                td.gx[r][c] = (td.surfZ[r][1]   - td.surfZ[r][0])   / (grid.xs[1]   - grid.xs[0]);
+            else if (c == nc-1)
+                td.gx[r][c] = (td.surfZ[r][c]   - td.surfZ[r][c-1]) / (grid.xs[c]   - grid.xs[c-1]);
+            else
+                td.gx[r][c] = (td.surfZ[r][c+1] - td.surfZ[r][c-1]) / (grid.xs[c+1] - grid.xs[c-1]);
+
+            if (r == 0)
+                td.gy[r][c] = (td.surfZ[1][c]   - td.surfZ[0][c])   / (grid.ys[1]   - grid.ys[0]);
+            else if (r == nr-1)
+                td.gy[r][c] = (td.surfZ[r][c]   - td.surfZ[r-1][c]) / (grid.ys[r]   - grid.ys[r-1]);
+            else
+                td.gy[r][c] = (td.surfZ[r+1][c] - td.surfZ[r-1][c]) / (grid.ys[r+1] - grid.ys[r-1]);
+        }
+    }
+    return td;
+}
+
+// Map physical (px, py) to fractional grid indices (fc, fr).
+// Returns false if outside the grid bounds.
+bool physToFrac(const Grid& grid, float px, float py, float& fc, float& fr) {
+    if (px < grid.xs.front() || px > grid.xs.back() ||
+        py < grid.ys.front() || py > grid.ys.back()) return false;
+
+    auto xIt = std::lower_bound(grid.xs.begin(), grid.xs.end(), px);
+    int c1 = (int)(xIt - grid.xs.begin());
+    if (c1 == 0) c1 = 1;
+    if (c1 >= grid.ncols()) c1 = grid.ncols() - 1;
+    int c0 = c1 - 1;
+    fc = c0 + (px - grid.xs[c0]) / (grid.xs[c1] - grid.xs[c0]);
+
+    auto yIt = std::lower_bound(grid.ys.begin(), grid.ys.end(), py);
+    int r1 = (int)(yIt - grid.ys.begin());
+    if (r1 == 0) r1 = 1;
+    if (r1 >= grid.nrows()) r1 = grid.nrows() - 1;
+    int r0 = r1 - 1;
+    fr = r0 + (py - grid.ys[r0]) / (grid.ys[r1] - grid.ys[r0]);
+
+    return true;
+}
+
+float bilerp(const std::vector<std::vector<float>>& f, float fc, float fr) {
+    int nc = (int)f[0].size(), nr = (int)f.size();
+    int c0 = std::max(0, std::min((int)fc, nc - 2));
+    int r0 = std::max(0, std::min((int)fr, nr - 2));
+    float tx = fc - c0, ty = fr - r0;
+    return (1-ty)*((1-tx)*f[r0][c0]   + tx*f[r0][c0+1])
+         +    ty *((1-tx)*f[r0+1][c0] + tx*f[r0+1][c0+1]);
+}
+
+// Trace one flow line from seed (px0, py0).
+// uphill=true follows the gradient (toward peak); false follows negative gradient.
+Toolpath traceFlowLine(const TraceData& td, float px0, float py0,
+                        float step_size, bool uphill, int max_steps) {
+    Toolpath path;
+    float px = px0, py = py0;
+    const float min_grad = 1e-3f;
+    float dir = uphill ? 1.0f : -1.0f;
+    float prev_z = uphill ? -1e10f : 1e10f;
+
+    for (int i = 0; i < max_steps; ++i) {
+        float fc, fr;
+        if (!physToFrac(*td.grid, px, py, fc, fr)) break;
+
+        float gx = bilerp(td.gx, fc, fr);
+        float gy = bilerp(td.gy, fc, fr);
+        float gmag = std::sqrt(gx*gx + gy*gy);
+        if (gmag < min_grad) break;
+
+        float z = bilerp(td.surfZ, fc, fr);
+        if (uphill  && z < prev_z - 1e-5f) break;  // past the peak
+        if (!uphill && z > prev_z + 1e-5f) break;  // past the valley
+        prev_z = z;
+
+        path.pts.push_back({px, py, z});
+
+        px += dir * (gx / gmag) * step_size;
+        py += dir * (gy / gmag) * step_size;
+    }
+    return path;
+}
+
+// Seed along all 4 edges, trace uphill toward the peak.
+std::vector<Toolpath> generateToolpaths(const TraceData& td,
+                                         float step_over, float step_size,
+                                         bool uphill, int max_steps) {
+    const Grid& grid = *td.grid;
+    std::vector<Toolpath> paths;
+    float xmin = grid.xs.front(), xmax = grid.xs.back();
+    float ymin = grid.ys.front(), ymax = grid.ys.back();
+
+    for (float x = xmin; x <= xmax + 1e-6f; x += step_over)
+        paths.push_back(traceFlowLine(td, x, ymin, step_size, uphill, max_steps));
+    for (float x = xmin; x <= xmax + 1e-6f; x += step_over)
+        paths.push_back(traceFlowLine(td, x, ymax, step_size, uphill, max_steps));
+    for (float y = ymin + step_over; y < ymax - 1e-6f; y += step_over)
+        paths.push_back(traceFlowLine(td, xmin, y, step_size, uphill, max_steps));
+    for (float y = ymin + step_over; y < ymax - 1e-6f; y += step_over)
+        paths.push_back(traceFlowLine(td, xmax, y, step_size, uphill, max_steps));
+
+    paths.erase(std::remove_if(paths.begin(), paths.end(),
+        [](const Toolpath& p){ return p.pts.size() < 2; }), paths.end());
+
+    std::cout << "Generated " << paths.size() << " toolpaths" << std::endl;
+    return paths;
+}
+
+// --- G-code output --------------------------------------------------------
+
+void writeGCode(const std::vector<Toolpath>& paths, const std::string& filename,
+                float feedrate, float safe_z) {
+    std::ofstream f(filename);
+    f << std::fixed << std::setprecision(4);
+    f << "( makeWRMToolpath )\n";
+    f << "G90 G94\n";
+    f << "F" << std::setprecision(0) << feedrate << "\n";
+    f << std::setprecision(4);
+    f << "G0 Z" << safe_z << "\n";
+
+    int total_pts = 0;
+    for (const auto& path : paths) {
+        if (path.pts.empty()) continue;
+        f << "G0 X" << path.pts[0].x << " Y" << path.pts[0].y << "\n";
+        f << "G1 Z" << path.pts[0].z << "\n";
+        for (size_t i = 1; i < path.pts.size(); ++i)
+            f << "G1 X" << path.pts[i].x
+              << " Y"   << path.pts[i].y
+              << " Z"   << path.pts[i].z << "\n";
+        f << "G0 Z" << safe_z << "\n";
+        total_pts += (int)path.pts.size();
+    }
+
+    f << "G0 Z" << safe_z << "\n";
+    f << "M30\n";
+    std::cout << "Wrote " << filename << " (" << paths.size() << " paths, "
+              << total_pts << " points)" << std::endl;
+}
+
+// --------------------------------------------------------------------------
+
 int main(int argc, char* argv[]) {
     std::string inputFile = "RainierPeakReduced.stl";
     if (argc > 1)
@@ -187,5 +356,20 @@ int main(int argc, char* argv[]) {
     Surface offset = computeOffsetSurface(grid, ball_radius);
     printSurfaceBounds(offset);
 
+    const float step_over = 0.020f;   // inches between adjacent paths
+    const float step_size = 0.002f;   // inches per integration step
+    const float feedrate  = 60.0f;    // ipm -- edit at top of output .nc file
+    const bool  uphill    = true;     // trace from edge toward peak
+
+    TraceData td = buildTraceData(grid, offset);
+    auto paths   = generateToolpaths(td, step_over, step_size, uphill, 1500);
+
+    float safe_z = 0.0f;
+    for (const auto& row : offset.pts)
+        for (const auto& p : row)
+            safe_z = std::max(safe_z, p.z);
+    safe_z += 0.10f;
+
+    writeGCode(paths, "output.nc", feedrate, safe_z);
     return 0;
 }
