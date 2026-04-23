@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <limits>
+#include <map>
 
 struct Point {
     float x, y, z;
@@ -51,6 +52,41 @@ bool readSTL(const std::string& filename, std::vector<Triangle>& triangles) {
     return true;
 }
 
+struct Grid {
+    std::vector<float> xs;          // unique X values, sorted
+    std::vector<float> ys;          // unique Y values, sorted
+    std::vector<std::vector<float>> z; // z[row][col], row=Y index, col=X index
+    int nrows() const { return (int)ys.size(); }
+    int ncols() const { return (int)xs.size(); }
+};
+
+bool reconstructGrid(const std::vector<Triangle>& triangles, Grid& grid) {
+    std::map<float, int> xmap, ymap;
+
+    for (const auto& tri : triangles)
+        for (const auto& v : tri.vertices) {
+            xmap[v.x] = 0;
+            ymap[v.y] = 0;
+        }
+
+    for (auto& kv : xmap) grid.xs.push_back(kv.first);
+    for (auto& kv : ymap) grid.ys.push_back(kv.first);
+
+    // index maps for fast lookup
+    for (int i = 0; i < (int)grid.xs.size(); ++i) xmap[grid.xs[i]] = i;
+    for (int i = 0; i < (int)grid.ys.size(); ++i) ymap[grid.ys[i]] = i;
+
+    grid.z.assign(grid.nrows(), std::vector<float>(grid.ncols(), 0.0f));
+
+    for (const auto& tri : triangles)
+        for (const auto& v : tri.vertices)
+            grid.z[ymap[v.y]][xmap[v.x]] = v.z;
+
+    std::cout << "Grid reconstructed: " << grid.ncols() << " cols x "
+              << grid.nrows() << " rows" << std::endl;
+    return true;
+}
+
 void printBoundingBox(const std::vector<Triangle>& triangles) {
     float xmin =  std::numeric_limits<float>::max();
     float ymin =  std::numeric_limits<float>::max();
@@ -83,5 +119,10 @@ int main(int argc, char* argv[]) {
         return 1;
 
     printBoundingBox(triangles);
+
+    Grid grid;
+    if (!reconstructGrid(triangles, grid))
+        return 1;
+
     return 0;
 }
