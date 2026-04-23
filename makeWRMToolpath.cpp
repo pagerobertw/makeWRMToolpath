@@ -87,6 +87,65 @@ bool reconstructGrid(const std::vector<Triangle>& triangles, Grid& grid) {
     return true;
 }
 
+// --- Offset surface -------------------------------------------------------
+
+// Finite-difference helpers for gradient at grid point (r, c)
+static float dzdxAt(const Grid& g, int r, int c) {
+    if (c == 0)            return (g.z[r][1]     - g.z[r][0])     / (g.xs[1]   - g.xs[0]);
+    if (c == g.ncols()-1)  return (g.z[r][c]     - g.z[r][c-1])   / (g.xs[c]   - g.xs[c-1]);
+    return                        (g.z[r][c+1]   - g.z[r][c-1])   / (g.xs[c+1] - g.xs[c-1]);
+}
+
+static float dzdyAt(const Grid& g, int r, int c) {
+    if (r == 0)            return (g.z[1][c]     - g.z[0][c])     / (g.ys[1]   - g.ys[0]);
+    if (r == g.nrows()-1)  return (g.z[r][c]     - g.z[r-1][c])   / (g.ys[r]   - g.ys[r-1]);
+    return                        (g.z[r+1][c]   - g.z[r-1][c])   / (g.ys[r+1] - g.ys[r-1]);
+}
+
+// Offset surface: each grid point shifted along its surface normal by ball_radius.
+// Result is stored as a 2D array of 3D points (X and Y shift slightly on steep slopes).
+struct Surface {
+    int rows, cols;
+    std::vector<std::vector<Point>> pts;
+};
+
+Surface computeOffsetSurface(const Grid& grid, float ball_radius) {
+    int nr = grid.nrows(), nc = grid.ncols();
+    Surface s;
+    s.rows = nr;  s.cols = nc;
+    s.pts.assign(nr, std::vector<Point>(nc));
+
+    for (int r = 0; r < nr; ++r) {
+        for (int c = 0; c < nc; ++c) {
+            float gx = dzdxAt(grid, r, c);
+            float gy = dzdyAt(grid, r, c);
+            // Surface normal: (-dz/dx, -dz/dy, 1), normalized
+            float nx = -gx, ny = -gy, nz = 1.0f;
+            float len = std::sqrt(nx*nx + ny*ny + nz*nz);
+            nx /= len;  ny /= len;  nz /= len;
+
+            s.pts[r][c] = { grid.xs[c] + nx * ball_radius,
+                            grid.ys[r] + ny * ball_radius,
+                            grid.z[r][c] + nz * ball_radius };
+        }
+    }
+    return s;
+}
+
+void printSurfaceBounds(const Surface& s) {
+    float zmin =  std::numeric_limits<float>::max();
+    float zmax = -std::numeric_limits<float>::max();
+    for (const auto& row : s.pts)
+        for (const auto& p : row) {
+            zmin = std::min(zmin, p.z);
+            zmax = std::max(zmax, p.z);
+        }
+    std::cout << "Offset surface Z: " << zmin << " to " << zmax
+              << "  (" << (zmax - zmin) << " in)" << std::endl;
+}
+
+// --------------------------------------------------------------------------
+
 void printBoundingBox(const std::vector<Triangle>& triangles) {
     float xmin =  std::numeric_limits<float>::max();
     float ymin =  std::numeric_limits<float>::max();
@@ -123,6 +182,10 @@ int main(int argc, char* argv[]) {
     Grid grid;
     if (!reconstructGrid(triangles, grid))
         return 1;
+
+    const float ball_radius = 0.125f;  // 1/4" ball mill
+    Surface offset = computeOffsetSurface(grid, ball_radius);
+    printSurfaceBounds(offset);
 
     return 0;
 }
