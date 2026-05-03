@@ -175,6 +175,37 @@ struct Toolpath {
     std::vector<Point> pts;
 };
 
+// 2D occupancy grid: cells sized at step_size so detection is reliable.
+// A cell is marked when a completed path passes through it.
+// New paths stop when they enter an already-occupied cell.
+struct OccupancyGrid {
+    float xmin, ymin, cell;
+    int   cols, rows;
+    std::vector<bool> cells;
+
+    OccupancyGrid(float xmin, float ymin, float xmax, float ymax, float cell_size)
+        : xmin(xmin), ymin(ymin), cell(cell_size) {
+        cols = (int)((xmax - xmin) / cell_size) + 2;
+        rows = (int)((ymax - ymin) / cell_size) + 2;
+        cells.assign(rows * cols, false);
+    }
+
+    int toCol(float px) const { return (int)((px - xmin) / cell); }
+    int toRow(float py) const { return (int)((py - ymin) / cell); }
+
+    bool isOccupied(float px, float py) const {
+        int c = toCol(px), r = toRow(py);
+        if (c < 0 || c >= cols || r < 0 || r >= rows) return false;
+        return cells[r * cols + c];
+    }
+
+    void mark(float px, float py) {
+        int c = toCol(px), r = toRow(py);
+        if (c >= 0 && c < cols && r >= 0 && r < rows)
+            cells[r * cols + c] = true;
+    }
+};
+
 // Precomputed interpolation data for the offset surface
 struct TraceData {
     const Grid* grid;
@@ -216,26 +247,33 @@ TraceData buildTraceData(const Grid& grid, const Surface& surf) {
 }
 
 // Map physical (px, py) to fractional grid indices (fc, fr).
-// Returns false if outside the grid bounds.
-bool physToFrac(const Grid& grid, float px, float py, float& fc, float& fr) {
-    if (px < grid.xs.front() || px > grid.xs.back() ||
-        py < grid.ys.front() || py > grid.ys.back()) return false;
+// If clamp=true, positions outside the boundary are clamped to the edge
+// (so the caller gets the edge Z value) and the return value indicates
+// whether the position was inside (true) or outside/clamped (false).
+bool physToFrac(const Grid& grid, float px, float py, float& fc, float& fr,
+                bool clamp = false) {
+    bool inside = !(px < grid.xs.front() || px > grid.xs.back() ||
+                    py < grid.ys.front() || py > grid.ys.back());
+    if (!inside && !clamp) return false;
 
-    auto xIt = std::lower_bound(grid.xs.begin(), grid.xs.end(), px);
+    float cpx = std::max(grid.xs.front(), std::min(grid.xs.back(),  px));
+    float cpy = std::max(grid.ys.front(), std::min(grid.ys.back(), py));
+
+    auto xIt = std::lower_bound(grid.xs.begin(), grid.xs.end(), cpx);
     int c1 = (int)(xIt - grid.xs.begin());
     if (c1 == 0) c1 = 1;
     if (c1 >= grid.ncols()) c1 = grid.ncols() - 1;
     int c0 = c1 - 1;
-    fc = c0 + (px - grid.xs[c0]) / (grid.xs[c1] - grid.xs[c0]);
+    fc = c0 + (cpx - grid.xs[c0]) / (grid.xs[c1] - grid.xs[c0]);
 
-    auto yIt = std::lower_bound(grid.ys.begin(), grid.ys.end(), py);
+    auto yIt = std::lower_bound(grid.ys.begin(), grid.ys.end(), cpy);
     int r1 = (int)(yIt - grid.ys.begin());
     if (r1 == 0) r1 = 1;
     if (r1 >= grid.nrows()) r1 = grid.nrows() - 1;
     int r0 = r1 - 1;
-    fr = r0 + (py - grid.ys[r0]) / (grid.ys[r1] - grid.ys[r0]);
+    fr = r0 + (cpy - grid.ys[r0]) / (grid.ys[r1] - grid.ys[r0]);
 
-    return true;
+    return inside;
 }
 
 float bilerp(const std::vector<std::vector<float>>& f, float fc, float fr) {
@@ -250,31 +288,50 @@ float bilerp(const std::vector<std::vector<float>>& f, float fc, float fr) {
 // Trace one flow line from seed (px0, py0).
 // uphill=true follows the gradient (toward peak); false follows negative gradient.
 Toolpath traceFlowLine(const TraceData& td, float px0, float py0,
-                        float step_size, bool uphill, int max_steps) {
+                        float step_size, bool uphill, int max_steps,
+                        float ball_radius, OccupancyGrid* occ = nullptr) {
     Toolpath path;
     float px = px0, py = py0;
     const float min_grad = 1e-3f;
     float dir = uphill ? 1.0f : -1.0f;
     float prev_z = uphill ? -1e10f : 1e10f;
 
+    const Grid& grid = *td.grid;
+    float xmin = grid.xs.front(), xmax = grid.xs.back();
+    float ymin = grid.ys.front(), ymax = grid.ys.back();
+    float last_dx = 0.0f, last_dy = 0.0f;  // last normalized step direction
+
     for (int i = 0; i < max_steps; ++i) {
         float fc, fr;
-        if (!physToFrac(*td.grid, px, py, fc, fr)) break;
+        bool inside = physToFrac(grid, px, py, fc, fr, /*clamp=*/true);
+
+        if (!inside) {
+            float ox = std::max(0.0f, std::max(xmin - px, px - xmax));
+            float oy = std::max(0.0f, std::max(ymin - py, py - ymax));
+            if (std::sqrt(ox*ox + oy*oy) >= ball_radius) break;
+        }
+
+        // Stop if this cell was already covered by an earlier path
+        if (inside && occ && occ->isOccupied(px, py)) break;
 
         float gx = bilerp(td.gx, fc, fr);
         float gy = bilerp(td.gy, fc, fr);
         float gmag = std::sqrt(gx*gx + gy*gy);
-        if (gmag < min_grad) break;
+        if (inside && gmag < min_grad) break;
 
         float z = bilerp(td.surfZ, fc, fr);
-        if (uphill  && z < prev_z - 1e-5f) break;  // past the peak
-        if (!uphill && z > prev_z + 1e-5f) break;  // past the valley
+        if (uphill  && z < prev_z - 1e-5f) break;
+        if (!uphill && z > prev_z + 1e-5f) break;
         prev_z = z;
 
         path.pts.push_back({px, py, z});
 
-        px += dir * (gx / gmag) * step_size;
-        py += dir * (gy / gmag) * step_size;
+        if (inside && gmag >= min_grad) {
+            last_dx = dir * gx / gmag;
+            last_dy = dir * gy / gmag;
+        }
+        px += last_dx * step_size;
+        py += last_dy * step_size;
     }
     return path;
 }
@@ -284,15 +341,24 @@ Toolpath traceFlowLine(const TraceData& td, float px0, float py0,
 // seed coverage regardless of terrain shape.
 std::vector<Toolpath> generateToolpaths(const TraceData& td,
                                          float step_over, float step_size,
-                                         bool uphill, int max_steps) {
+                                         bool uphill, int max_steps,
+                                         float ball_radius) {
     const Grid& grid = *td.grid;
     std::vector<Toolpath> paths;
     float xmin = grid.xs.front(), xmax = grid.xs.back();
     float ymin = grid.ys.front(), ymax = grid.ys.back();
 
-    for (float x = xmin; x <= xmax + 1e-6f; x += step_over)
-        for (float y = ymin; y <= ymax + 1e-6f; y += step_over)
-            paths.push_back(traceFlowLine(td, x, y, step_size, uphill, max_steps));
+    OccupancyGrid occ(xmin, ymin, xmax, ymax, step_size);
+
+    for (float x = xmin; x <= xmax + 1e-6f; x += step_over) {
+        for (float y = ymin; y <= ymax + 1e-6f; y += step_over) {
+            Toolpath path = traceFlowLine(td, x, y, step_size, uphill, max_steps,
+                                          ball_radius, &occ);
+            for (const auto& pt : path.pts)
+                occ.mark(pt.x, pt.y);
+            paths.push_back(std::move(path));
+        }
+    }
 
     paths.erase(std::remove_if(paths.begin(), paths.end(),
         [](const Toolpath& p){ return p.pts.size() < 2; }), paths.end());
@@ -353,13 +419,13 @@ int main(int argc, char* argv[]) {
     Surface offset = computeOffsetSurface(grid, ball_radius);
     printSurfaceBounds(offset);
 
-    const float step_over = 0.020f;   // inches between seed points
-    const float step_size = 0.002f;   // inches per integration step along path
+    const float step_over = 0.1f;     // inches between seed points
+    const float step_size = 0.010f;   // inches per integration step along path
     const float feedrate  = 60.0f;    // ipm -- edit at top of output .nc file
     const bool  uphill    = false;    // false = trace downhill (rain model)
 
     TraceData td = buildTraceData(grid, offset);
-    auto paths   = generateToolpaths(td, step_over, step_size, uphill, 1500);
+    auto paths   = generateToolpaths(td, step_over, step_size, uphill, 1500, ball_radius);
 
     float safe_z = 0.0f;
     for (const auto& row : offset.pts)
