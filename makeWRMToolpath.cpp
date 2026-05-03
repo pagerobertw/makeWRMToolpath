@@ -279,7 +279,9 @@ Toolpath traceFlowLine(const TraceData& td, float px0, float py0,
     return path;
 }
 
-// Seed along all 4 edges, trace uphill toward the peak.
+// Seed points on a regular step_over grid across the entire model surface,
+// then trace each one downhill (or uphill). This "rain" strategy gives uniform
+// seed coverage regardless of terrain shape.
 std::vector<Toolpath> generateToolpaths(const TraceData& td,
                                          float step_over, float step_size,
                                          bool uphill, int max_steps) {
@@ -288,43 +290,10 @@ std::vector<Toolpath> generateToolpaths(const TraceData& td,
     float xmin = grid.xs.front(), xmax = grid.xs.back();
     float ymin = grid.ys.front(), ymax = grid.ys.back();
 
-    //for (float x = xmin; x <= xmax + 1e-6f; x += step_over)
-    //    paths.push_back(traceFlowLine(td, x, ymin, step_size, uphill, max_steps));
-    //for (float x = xmin; x <= xmax + 1e-6f; x += step_over)
-    //    paths.push_back(traceFlowLine(td, x, ymax, step_size, uphill, max_steps));
-    //for (float y = ymin + step_over; y < ymax - 1e-6f; y += step_over)
-    //    paths.push_back(traceFlowLine(td, xmin, y, step_size, uphill, max_steps));
-    //for (float y = ymin + step_over; y < ymax - 1e-6f; y += step_over)
-    //    paths.push_back(traceFlowLine(td, xmax, y, step_size, uphill, max_steps));
-
-    //for (float x = xmin; x <= xmax + 1e-6f; x += step_over)
-    //{
-    //  for (float y = ymin + step_over; y < ymax - 1e-6f; y += step_over)
-    //    paths.push_back(traceFlowLine(td, x, y, step_size, uphill, max_steps));
-    //}
-
-    //for (float x = xmin; x <= xmax + 1e-6f; x += step_over)
-    //{
-    //  for (float y = ymax / 2.00 + step_over; y < ymax - 1e-6f; y += step_over)
-    //    paths.push_back(traceFlowLine(td, x, y, step_size, uphill, max_steps));
-    //}
-
-    // Drop rain from midline to the top edge.
-    // Start on left edge and run to right, then increment y and do it again.
     for (float x = xmin; x <= xmax + 1e-6f; x += step_over)
-    {
-      for (float y = ymax / 2.00 + step_over; y < ymax + 1e-6f; y += step_over)
-        paths.push_back(traceFlowLine(td, x, y, step_size, uphill, max_steps));
-    }
+        for (float y = ymin; y <= ymax + 1e-6f; y += step_over)
+            paths.push_back(traceFlowLine(td, x, y, step_size, uphill, max_steps));
 
-    // Drop rain from midline to the bottom edge. 
-    // Start on left edge and run to right, then decrement y and do it again
-    for (float x = xmin; x <= xmax + 1e-6f; x += step_over)
-    {
-      for (float y = ymax / 2.00; y > ymin - 1e-6f; y -= step_over)
-        paths.push_back(traceFlowLine(td, x, y, step_size, uphill, max_steps));
-    }
- 
     paths.erase(std::remove_if(paths.begin(), paths.end(),
         [](const Toolpath& p){ return p.pts.size() < 2; }), paths.end());
 
@@ -384,12 +353,10 @@ int main(int argc, char* argv[]) {
     Surface offset = computeOffsetSurface(grid, ball_radius);
     printSurfaceBounds(offset);
 
-    //const float step_over = 0.020f;   // inches between adjacent paths
-    const float step_over = 0.1f;     // make 5x greater than first trial to see what's happening
-    const float step_size = 0.002f;   // inches per integration step
+    const float step_over = 0.020f;   // inches between seed points
+    const float step_size = 0.002f;   // inches per integration step along path
     const float feedrate  = 60.0f;    // ipm -- edit at top of output .nc file
-    //const bool  uphill    = true;     // trace from edge toward peak
-    const bool  uphill    = false;     // wherever the rain falls, trace it downhill
+    const bool  uphill    = false;    // false = trace downhill (rain model)
 
     TraceData td = buildTraceData(grid, offset);
     auto paths   = generateToolpaths(td, step_over, step_size, uphill, 1500);
