@@ -81,7 +81,7 @@ bool reconstructGrid(const std::vector<Triangle>& triangles, Grid& grid) {
 
     for (const auto& tri : triangles)
         for (const auto& v : tri.vertices)
-            grid.z[ymap[v.y]][xmap[v.x]] = v.z;
+            grid.z[ymap[v.y]][xmap[v.x]] = std::max(grid.z[ymap[v.y]][xmap[v.x]], v.z);
 
     std::cout << "Grid reconstructed: " << grid.ncols() << " cols x "
               << grid.nrows() << " rows" << std::endl;
@@ -133,16 +133,24 @@ Surface computeOffsetSurface(const Grid& grid, float ball_radius) {
     return s;
 }
 
-void printSurfaceBounds(const Surface& s) {
+void printSurfaceBounds(const Surface& s, const Grid& grid) {
     float zmin =  std::numeric_limits<float>::max();
     float zmax = -std::numeric_limits<float>::max();
-    for (const auto& row : s.pts)
-        for (const auto& p : row) {
-            zmin = std::min(zmin, p.z);
-            zmax = std::max(zmax, p.z);
+    int rmin=-1, cmin=-1, rmax=-1, cmax=-1;
+    for (int r=0; r<s.rows; ++r)
+        for (int c=0; c<s.cols; ++c) {
+            float z = s.pts[r][c].z;
+            if (z < zmin) { zmin=z; rmin=r; cmin=c; }
+            if (z > zmax) { zmax=z; rmax=r; cmax=c; }
         }
     std::cout << "Offset surface Z: " << zmin << " to " << zmax
               << "  (" << (zmax - zmin) << " in)" << std::endl;
+    std::cout << "  min at r=" << rmin << " c=" << cmin
+              << " (x=" << grid.xs[cmin] << " y=" << grid.ys[rmin]
+              << " terrain_z=" << grid.z[rmin][cmin] << ")" << std::endl;
+    std::cout << "  max at r=" << rmax << " c=" << cmax
+              << " (x=" << grid.xs[cmax] << " y=" << grid.ys[rmax]
+              << " terrain_z=" << grid.z[rmax][cmax] << ")" << std::endl;
 }
 
 // --------------------------------------------------------------------------
@@ -333,6 +341,22 @@ Toolpath traceFlowLine(const TraceData& td, float px0, float py0,
         px += last_dx * step_size;
         py += last_dy * step_size;
     }
+
+    // If the path ended outside the model boundary (boundary extension fired),
+    // descend the side wall straight down to ball_radius above Z=0.
+    // Lines meet lines — no arc blend.
+    if (!path.pts.empty()) {
+        Point last = path.pts.back();  // copy before push_back may reallocate
+        bool last_outside = (last.x < xmin || last.x > xmax ||
+                             last.y < ymin || last.y > ymax);
+        if (last_outside && last.z > ball_radius) {
+            int nsteps = (int)((last.z - ball_radius) / step_size);
+            for (int k = 1; k <= nsteps; ++k)
+                path.pts.push_back({last.x, last.y, last.z - k * step_size});
+            path.pts.push_back({last.x, last.y, ball_radius});
+        }
+    }
+
     return path;
 }
 
@@ -350,8 +374,12 @@ std::vector<Toolpath> generateToolpaths(const TraceData& td,
 
     OccupancyGrid occ(xmin, ymin, xmax, ymax, step_size);
 
-    for (float x = xmin; x <= xmax + 1e-6f; x += step_over) {
-        for (float y = ymin; y <= ymax + 1e-6f; y += step_over) {
+    int nx_seeds = (int)std::round((xmax - xmin) / step_over) + 1;
+    int ny_seeds = (int)std::round((ymax - ymin) / step_over) + 1;
+    for (int ix = 0; ix < nx_seeds; ++ix) {
+        float x = xmin + ix * step_over;
+        for (int iy = 0; iy < ny_seeds; ++iy) {
+            float y = ymin + iy * step_over;
             Toolpath path = traceFlowLine(td, x, y, step_size, uphill, max_steps,
                                           ball_radius, &occ);
             for (const auto& pt : path.pts)
@@ -401,6 +429,7 @@ void writeGCode(const std::vector<Toolpath>& paths, const std::string& filename,
 // --------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
+    std::cout << "build: " << __DATE__ << " " << __TIME__ << std::endl;
     std::string inputFile = "RainierPeakReduced.stl";
     if (argc > 1)
         inputFile = argv[1];
@@ -417,7 +446,7 @@ int main(int argc, char* argv[]) {
 
     const float ball_radius = 0.125f;  // 1/4" ball mill
     Surface offset = computeOffsetSurface(grid, ball_radius);
-    printSurfaceBounds(offset);
+    printSurfaceBounds(offset, grid);
 
     const float step_over = 0.1f;     // inches between seed points
     const float step_size = 0.010f;   // inches per integration step along path
