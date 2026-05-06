@@ -342,21 +342,6 @@ Toolpath traceFlowLine(const TraceData& td, float px0, float py0,
         py += last_dy * step_size;
     }
 
-    // If the path ended outside the model boundary (boundary extension fired),
-    // descend the side wall straight down to ball_radius above Z=0.
-    // Lines meet lines — no arc blend.
-    if (!path.pts.empty()) {
-        Point last = path.pts.back();  // copy before push_back may reallocate
-        bool last_outside = (last.x < xmin || last.x > xmax ||
-                             last.y < ymin || last.y > ymax);
-        if (last_outside && last.z > ball_radius) {
-            int nsteps = (int)((last.z - ball_radius) / step_size);
-            for (int k = 1; k <= nsteps; ++k)
-                path.pts.push_back({last.x, last.y, last.z - k * step_size});
-            path.pts.push_back({last.x, last.y, ball_radius});
-        }
-    }
-
     return path;
 }
 
@@ -374,8 +359,8 @@ std::vector<Toolpath> generateToolpaths(const TraceData& td,
 
     OccupancyGrid occ(xmin, ymin, xmax, ymax, step_size);
 
-    int nx_seeds = (int)std::round((xmax - xmin) / step_over) + 1;
-    int ny_seeds = (int)std::round((ymax - ymin) / step_over) + 1;
+    int nx_seeds = (int)std::floor((xmax - xmin) / step_over + 1e-6f) + 1;
+    int ny_seeds = (int)std::floor((ymax - ymin) / step_over + 1e-6f) + 1;
     for (int ix = 0; ix < nx_seeds; ++ix) {
         float x = xmin + ix * step_over;
         for (int iy = 0; iy < ny_seeds; ++iy) {
