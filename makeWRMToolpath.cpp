@@ -536,99 +536,333 @@ Toolpath traceD8Path(const Grid& grid, const TraceData& td,
     return path;
 }
 
-// Seed points on a regular step_over grid across the entire model surface,
-// then trace each one downhill (or uphill). This "rain" strategy gives uniform
-// seed coverage regardless of terrain shape.
+// Offset a toolpath laterally in XY by 'dist' inches.
+// Positive dist = left (CCW from the path direction); negative = right.
+// Z at each offset point is read from the offset surface.
+// The path stops when it leaves the terrain model.
+// Boundary-edge protection (last_z for outermost 2 rows/cols) matches traceD8Path.
+static Toolpath offsetPath(const Toolpath& prev, float dist,
+                             const TraceData& td, const Grid& grid,
+                             float ball_radius) {
+    Toolpath result;
+    int n = (int)prev.pts.size();
+    if (n < 2) return result;
+
+    int nr = grid.nrows(), nc = grid.ncols();
+    float gdx = grid.xs[1] - grid.xs[0];
+    float gdy = grid.ys[1] - grid.ys[0];
+    // Ball-radius margin: the ball center must stay at least ball_radius from any
+    // vertical face (model edge wall).  At 0.125" ball on a 0.01" grid = 13 cells.
+    int bnd = std::max(2, (int)std::ceil(ball_radius / std::min(gdx, gdy)));
+    float last_z = 0.0f;
+    bool  have_last_z = false;
+
+    for (int i = 0; i < n; ++i) {
+        // Forward tangent from adjacent points (one-sided at endpoints)
+        int i0 = std::max(0, i-1), i1 = std::min(n-1, i+1);
+        float tx = prev.pts[i1].x - prev.pts[i0].x;
+        float ty = prev.pts[i1].y - prev.pts[i0].y;
+        float tlen = std::sqrt(tx*tx + ty*ty);
+        if (tlen < 1e-9f) continue;
+
+        // CCW perpendicular scaled by dist
+        float ox = prev.pts[i].x + (-ty / tlen) * dist;
+        float oy = prev.pts[i].y + ( tx / tlen) * dist;
+
+        // Nearest grid cell for surfZ lookup
+        int col = (int)std::round((ox - grid.xs.front()) / gdx);
+        int row = (int)std::round((oy - grid.ys.front()) / gdy);
+        col = std::max(0, std::min(col, nc-1));
+        row = std::max(0, std::min(row, nr-1));
+
+        if (grid.z[row][col] < ball_radius) break;  // stepped off the terrain
+
+        bool onBoundary = (row < bnd || row >= nr-bnd || col < bnd || col >= nc-bnd);
+        float z = td.surfZ[row][col];
+        if (!onBoundary) { last_z = z; have_last_z = true; }
+        else if (have_last_z) z = last_z;
+
+        result.pts.push_back({ox, oy, z});
+    }
+    return result;
+}
+
+// Drainage-family toolpath generation.
+//
+// 1. Place spine seeds on a coarse grid; each snaps to the highest flow-
+//    accumulation cell in its neighbourhood so it lands on a real channel.
+// 2. Trace D8 from each spine seed (summit → boundary) — these are the
+//    drainage-channel paths.
+// 3. Grow a "family" on each side of every spine: repeatedly step one
+//    step_over perpendicular to the local flow direction, trace D8 from
+//    that new start, and repeat until the next step would be off-terrain
+//    or would duplicate another family's starting cell.
+//
+// No OccupancyGrid during tracing — every path runs its full length.
+// Paths converge naturally in valleys (terrain pulls them together) and
+// diverge on ridges (terrain spreads them apart), which reinforces the
+// topography visually without imposing a mechanical regular grid.
+//
+// Tuning knobs (in main or here):
+//   SPINE_MULT  — spine spacing = SPINE_MULT * step_over.  Larger → fewer,
+//                 wider families; smaller → more, narrower families.
+//   MIN_PTS     — discard paths shorter than this many grid steps.
 std::vector<Toolpath> generateToolpaths(const TraceData& td,
-                                         float step_over, float step_size,
-                                         bool uphill, int max_steps,
+                                         float step_over, float /*step_size*/,
+                                         bool /*uphill*/, int /*max_steps*/,
                                          float ball_radius) {
     const Grid& grid = *td.grid;
-    std::vector<Toolpath> paths;
+    int nr = grid.nrows(), nc = grid.ncols();
+    float gdx = grid.xs[1] - grid.xs[0];
+    float gdy = grid.ys[1] - grid.ys[0];
     float xmin = grid.xs.front(), xmax = grid.xs.back();
     float ymin = grid.ys.front(), ymax = grid.ys.back();
 
-    float gdx = grid.xs[1] - grid.xs[0];
-    float gdy = grid.ys[1] - grid.ys[0];
-
-    // Compute D8 flow direction + accumulation on the offset surface.
-    // The tool follows the offset surface, so flow on that surface is what matters.
     auto filledZ = fillSinks(grid);
     FlowData flow = computeFlowData(grid, filledZ);
 
     float max_accum = 0.0f;
-    for (int r = 0; r < grid.nrows(); ++r)
-        for (int c = 0; c < grid.ncols(); ++c)
-            if (flow.accum[r][c] > max_accum) max_accum = flow.accum[r][c];
+    for (int r = 0; r < nr; ++r)
+        for (int c = 0; c < nc; ++c)
+            max_accum = std::max(max_accum, flow.accum[r][c]);
     std::cout << "Flow accum (terrain, sink-filled): max=" << (int)max_accum << std::endl;
 
-    // Seed on a regular step_over grid. Each seed snaps to the nearest offset-surface
-    // grid cell and traces via D8 direction — guaranteed to reach the model boundary.
-    // Sort by offset-surface elevation (highest first) so summit paths run before
-    // lower paths can mark their territory.
+    // --- Seed placement: regular step_over grid, proximity-based skipping ----
+    // Every step_over cell on valid terrain is a candidate seed.  Seeds are
+    // processed highest-elevation first.  A seed is skipped if it is already
+    // within step_over/2 of any previously generated path (dilated occupancy
+    // grid).  This guarantees full coverage: every terrain point is within
+    // step_over/2 of some generated path, with no mid-path stopping.
+    //
+    // Using pure D8 for every path (no geometric offset) means edge coverage
+    // is handled naturally by traceD8Path's boundary extension — no 13-cell
+    // offsetPath wall-avoidance zone.
+
+    const float cell_sz  = step_over * 0.25f;  // 4 occ-cells per step_over
+    // Seeds are srow_step=5 terrain cells apart = 4 occ-cells orthogonally,
+    // 4*sqrt(2)=5.66 occ-cells diagonally. mark_r=6 covers all 8 neighbors.
+    const int   mark_r   = 6;                  // dilation radius = 6*cell_sz = 1.5*step_over
+    OccupancyGrid occ(xmin, ymin, xmax, ymax, cell_sz);
+
     struct Seed { float z; int r, c; };
     std::vector<Seed> seeds;
+    int srow_step = std::max(1, (int)std::round(step_over / gdy));
+    int scol_step = std::max(1, (int)std::round(step_over / gdx));
+    for (int r = 0; r < nr; r += srow_step)
+        for (int c = 0; c < nc; c += scol_step)
+            if (grid.z[r][c] >= ball_radius)
+                seeds.push_back({td.surfZ[r][c], r, c});
 
-    int nx_seeds = (int)std::floor((xmax - xmin) / step_over + 1e-6f) + 1;
-    int ny_seeds = (int)std::floor((ymax - ymin) / step_over + 1e-6f) + 1;
-    for (int ix = 0; ix < nx_seeds; ++ix) {
-        float x = xmin + ix * step_over;
-        for (int iy = 0; iy < ny_seeds; ++iy) {
-            float y = ymin + iy * step_over;
-            int col = std::max(0, std::min((int)std::round((x - xmin) / gdx), grid.ncols() - 1));
-            int row = std::max(0, std::min((int)std::round((y - ymin) / gdy), grid.nrows() - 1));
-            if (grid.z[row][col] < ball_radius) continue;
-            seeds.push_back({td.surfZ[row][col], row, col});
-        }
-    }
+    std::sort(seeds.begin(), seeds.end(),
+              [](const Seed& a, const Seed& b){ return a.z > b.z; });
+    std::cout << "Seeds: " << seeds.size() << std::endl;
 
-    std::sort(seeds.begin(), seeds.end(), [](const Seed& a, const Seed& b){ return a.z > b.z; });
-
-    OccupancyGrid occ(xmin, ymin, xmax, ymax, step_over * 0.5f);
-
+    std::vector<Toolpath> paths;
     for (const auto& s : seeds) {
-        Toolpath path = traceD8Path(grid, td, flow, s.r, s.c, ball_radius, &occ);
-        for (const auto& pt : path.pts)
-            occ.mark(pt.x, pt.y);
-        paths.push_back(std::move(path));
+        float px = grid.xs[s.c], py = grid.ys[s.r];
+        if (occ.isOccupied(px, py)) continue;
+        Toolpath p = traceD8Path(grid, td, flow, s.r, s.c, ball_radius, nullptr);
+        if ((int)p.pts.size() < 2) continue;
+        // Mark occupancy using original (downhill) path points
+        for (const auto& pt : p.pts)
+            for (int dr = -mark_r; dr <= mark_r; ++dr)
+                for (int dc = -mark_r; dc <= mark_r; ++dc)
+                    if (dr*dr + dc*dc <= mark_r*mark_r)
+                        occ.mark(pt.x + dc*cell_sz, pt.y + dr*cell_sz);
+
+        // Reverse to boundary→interior: entry from workpiece edge, no mid-piece plunge
+        std::reverse(p.pts.begin(), p.pts.end());
+
+        // Prepend lead-in point outside workpiece boundary so the G-code
+        // plunge happens in air with the ball fully clear of the workpiece.
+        // Lead-in is placed exactly ball_radius past the nearest boundary wall
+        // (perpendicular), so the ball doesn't clip the edge during descent.
+        if (!p.pts.empty()) {
+            const Point& p0 = p.pts[0];  // boundary exit (new path start)
+            float d_ymin = p0.y - ymin;
+            float d_ymax = ymax - p0.y;
+            float d_xmin = p0.x - xmin;
+            float d_xmax = xmax - p0.x;
+            float md = std::min({d_ymin, d_ymax, d_xmin, d_xmax});
+            float lx = p0.x, ly = p0.y;
+            if      (md == d_ymin) ly = ymin - ball_radius;
+            else if (md == d_ymax) ly = ymax + ball_radius;
+            else if (md == d_xmin) lx = xmin - ball_radius;
+            else                   lx = xmax + ball_radius;
+            p.pts.insert(p.pts.begin(), {lx, ly, p0.z});
+        }
+        // Exit ramp: ease the tool out of the cut over the last 4 points
+        // so the lift mark is a gradual rise rather than an abrupt corner.
+        {
+            // Ramp to exactly ball_radius: contact width = 2*sqrt(r²-h²),
+            // which reaches zero at h=ball_radius — trough tapers to a line then vanishes.
+            const float br = ball_radius;
+            const float ramp[] = {0.001f, 0.002f, 0.004f, 0.008f, 0.014f,
+                                   0.022f, 0.035f, 0.056f, 0.086f, br};
+            const int nramp = 10;
+            int npts = (int)p.pts.size();
+            int n = std::min(nramp, npts);   // may be < nramp for short paths
+            for (int i = 0; i < n; ++i)
+                p.pts[npts - n + i].z += ramp[nramp - n + i]; // align to ramp end
+        }
+        paths.push_back(p);
     }
 
     paths.erase(std::remove_if(paths.begin(), paths.end(),
-        [](const Toolpath& p){ return p.pts.size() < 2; }), paths.end());
+        [](const Toolpath& p){ return (int)p.pts.size() < 2; }), paths.end());
 
     std::cout << "Generated " << paths.size() << " toolpaths" << std::endl;
     return paths;
 }
 
-// --- G-code output --------------------------------------------------------
+// --- Summit lawnmower pass ------------------------------------------------
+// Small zigzag sweep centered on the highest surface point to ensure the
+// peak is cleanly formed.  Appended after D8 paths so flanks are already
+// cut; plunges at the box edge land in previously-cut material.
+std::vector<Toolpath> generateSummitPasses(const TraceData& td, float ball_radius,
+                                            float step_over, float step_size) {
+    const Grid& grid = *td.grid;
+    float gdx = grid.xs[1] - grid.xs[0];
+    float gdy = grid.ys[1] - grid.ys[0];
 
+    // Locate peak (max offset surface)
+    float max_z = -1e30f; int pr = 0, pc = 0;
+    for (int r = 0; r < grid.nrows(); ++r)
+        for (int c = 0; c < grid.ncols(); ++c)
+            if (td.surfZ[r][c] > max_z) { max_z = td.surfZ[r][c]; pr = r; pc = c; }
+    float px = grid.xs[pc], py = grid.ys[pr];
+
+    const float rad = 0.5f;   // half-width of lawnmower region (inches)
+    float x0 = std::max(px - rad, grid.xs.front());
+    float x1 = std::min(px + rad, grid.xs.back());
+    float y0 = std::max(py - rad, grid.ys.front());
+    float y1 = std::min(py + rad, grid.ys.back());
+
+    const float ramp[] = {0.001f,0.002f,0.004f,0.008f,0.014f,
+                           0.022f,0.035f,0.056f,0.086f,ball_radius};
+    const int nramp = 10;
+
+    std::vector<Toolpath> passes;
+    bool going_right = true;
+    for (float y = y0; y <= y1 + 1e-5f; y += step_over) {
+        Toolpath p;
+        int rr = std::clamp((int)std::round((y - grid.ys.front()) / gdy),
+                            0, grid.nrows()-1);
+        float xa = going_right ? x0 : x1;
+        float xb = going_right ? x1 : x0;
+        float dx = going_right ? step_size : -step_size;
+        for (float x = xa; going_right ? (x <= xb+1e-5f) : (x >= xb-1e-5f); x += dx) {
+            int cc = std::clamp((int)std::round((x - grid.xs.front()) / gdx),
+                                0, grid.ncols()-1);
+            p.pts.push_back({x, y, td.surfZ[rr][cc]});
+        }
+        int npts = (int)p.pts.size();
+        int n = std::min(nramp, npts);
+        for (int i = 0; i < n; ++i)
+            p.pts[npts - n + i].z += ramp[nramp - n + i];
+        if (npts >= 2) passes.push_back(p);
+        going_right = !going_right;
+    }
+    std::cout << "Summit passes: " << passes.size()
+              << " (center " << px << "," << py << " r=" << rad << "\")\n";
+    return passes;
+}
+
+// --- Path reordering ------------------------------------------------------
+// Greedy nearest-neighbor sort: each path is followed by the closest unvisited
+// path (XY distance, previous end → next lead-in).  Groups geographically
+// adjacent paths so chaining opportunities are maximised.
+void reorderPaths(std::vector<Toolpath>& paths) {
+    int n = (int)paths.size();
+    if (n < 2) return;
+    std::vector<bool> used(n, false);
+    std::vector<int>  order;
+    order.reserve(n);
+    order.push_back(0);
+    used[0] = true;
+    for (int k = 1; k < n; ++k) {
+        const Point& cur = paths[order.back()].pts.back();
+        float best = std::numeric_limits<float>::max();
+        int   bi   = -1;
+        for (int i = 0; i < n; ++i) {
+            if (used[i] || paths[i].pts.empty()) continue;
+            float dx = paths[i].pts[0].x - cur.x;
+            float dy = paths[i].pts[0].y - cur.y;
+            float d  = dx*dx + dy*dy;
+            if (d < best) { best = d; bi = i; }
+        }
+        order.push_back(bi);
+        used[bi] = true;
+    }
+    std::vector<Toolpath> out;
+    out.reserve(n);
+    for (int i : order) out.push_back(std::move(paths[i]));
+    paths = std::move(out);
+    std::cout << "Paths reordered (nearest-neighbor)" << std::endl;
+}
+
+// --- G-code output --------------------------------------------------------
+// Coordinate transforms applied to every output coordinate:
+//   X  : unchanged
+//   Y  : y - y_max   (Y0 at back wall; all workpiece Y values are negative)
+//   Z  : z - z_top   (Z0 at top of part; all cuts are negative Z)
+// link_dist: chain threshold (0 = disabled).
 void writeGCode(const std::vector<Toolpath>& paths, const std::string& filename,
-                float feedrate, float safe_z) {
+                float feedrate, float safe_z, float link_dist,
+                float y_max, float z_top) {
+    auto fy = [&](float y){ return y - y_max; };
+    auto fz = [&](float z){ return z - z_top; };
+
+    int n = (int)paths.size();
+
+    // Pre-compute which paths chain from their predecessor
+    std::vector<bool> chains(n, false);
+    for (int i = 1; i < n; ++i) {
+        if (paths[i-1].pts.empty() || paths[i].pts.empty()) continue;
+        const Point& prev = paths[i-1].pts.back();
+        const Point& next = paths[i].pts[0];
+        float dx = next.x - prev.x, dy = next.y - prev.y;
+        if (std::sqrt(dx*dx + dy*dy) <= link_dist) chains[i] = true;
+    }
+
     std::ofstream f(filename);
     f << std::fixed << std::setprecision(4);
     f << "( makeWRMToolpath )\n";
     f << "G90 G94\n";
     f << "F" << std::setprecision(0) << feedrate << "\n";
     f << std::setprecision(4);
-    f << "G0 Z" << safe_z << "\n";
+    f << "G0 Z" << fz(safe_z) << "\n";
 
-    int total_pts = 0;
-    for (const auto& path : paths) {
+    int total_pts = 0, nchained = 0;
+    for (int pi = 0; pi < n; ++pi) {
+        const auto& path = paths[pi];
         if (path.pts.empty()) continue;
-        f << "G0 X" << path.pts[0].x << " Y" << path.pts[0].y << "\n";
-        f << "G1 Z" << path.pts[0].z << "\n";
+
+        if (chains[pi]) {
+            f << "G1 X" << path.pts[0].x << " Y" << fy(path.pts[0].y)
+              << " Z"   << fz(path.pts[0].z) << "\n";
+            ++nchained;
+        } else {
+            f << "G0 X" << path.pts[0].x << " Y" << fy(path.pts[0].y) << "\n";
+            f << "G1 Z" << fz(path.pts[0].z) << "\n";
+        }
+
         for (size_t i = 1; i < path.pts.size(); ++i)
             f << "G1 X" << path.pts[i].x
-              << " Y"   << path.pts[i].y
-              << " Z"   << path.pts[i].z << "\n";
-        f << "G0 Z" << safe_z << "\n";
+              << " Y"   << fy(path.pts[i].y)
+              << " Z"   << fz(path.pts[i].z) << "\n";
+
+        bool next_chains = (pi + 1 < n) && chains[pi + 1];
+        if (!next_chains)
+            f << "G0 Z" << fz(safe_z) << "\n";
+
         total_pts += (int)path.pts.size();
     }
 
-    f << "G0 Z" << safe_z << "\n";
+    f << "G0 Z" << fz(safe_z) << "\n";
     f << "M30\n";
     std::cout << "Wrote " << filename << " (" << paths.size() << " paths, "
-              << total_pts << " points)" << std::endl;
+              << total_pts << " points, " << nchained << " chained)\n";
 }
 
 // --------------------------------------------------------------------------
@@ -661,12 +895,23 @@ int main(int argc, char* argv[]) {
     TraceData td = buildTraceData(grid, offset);
     auto paths   = generateToolpaths(td, step_over, step_size, uphill, 1200, ball_radius);
 
-    float safe_z = 0.0f;
+    reorderPaths(paths);
+
+    // Append summit lawnmower passes (run after D8 flanks are cut)
+    auto summit = generateSummitPasses(td, ball_radius, step_over, step_size);
+    paths.insert(paths.end(), summit.begin(), summit.end());
+
+    // Z0 = top of part (max offset surface); safe_z stays positive above it
+    float z_top = 0.0f;
     for (const auto& row : offset.pts)
         for (const auto& p : row)
-            safe_z = std::max(safe_z, p.z);
-    safe_z += 0.10f;
+            z_top = std::max(z_top, p.z);
+    float safe_z = z_top + 0.10f + ball_radius;
 
-    writeGCode(paths, "output.nc", feedrate, safe_z);
+    // Y0 = back wall of workpiece; all workpiece Y values output as negative
+    float y_max = grid.ys.back();
+
+    const float link_dist = 0.5f;
+    writeGCode(paths, "output.nc", feedrate, safe_z, link_dist, y_max, z_top);
     return 0;
 }
