@@ -64,11 +64,27 @@ struct Grid {
 bool reconstructGrid(const std::vector<Triangle>& triangles, Grid& grid) {
     std::map<float, int> xmap, ymap;
 
-    for (const auto& tri : triangles)
+    // Only include upward-facing triangle vertices.
+    // Use the computed (geometric) normal, not the stored STL normal — many exporters
+    // write zero stored normals for flat faces such as the flat base.
+    // Walls have all vertices at the same x or y, so their computed nz = 0 exactly.
+    // The bottom face has nz < 0 (downward-facing).
+    // Only terrain and flat-border triangles have nz > 0.
+    auto computedNz = [](const Triangle& t) -> float {
+        float ax = t.vertices[1].x - t.vertices[0].x;
+        float ay = t.vertices[1].y - t.vertices[0].y;
+        float bx = t.vertices[2].x - t.vertices[0].x;
+        float by = t.vertices[2].y - t.vertices[0].y;
+        return ax * by - ay * bx;  // z component of cross product (unnormalized)
+    };
+
+    for (const auto& tri : triangles) {
+        if (computedNz(tri) <= 0.0f) continue;
         for (const auto& v : tri.vertices) {
             xmap[v.x] = 0;
             ymap[v.y] = 0;
         }
+    }
 
     for (auto& kv : xmap) grid.xs.push_back(kv.first);
     for (auto& kv : ymap) grid.ys.push_back(kv.first);
@@ -78,9 +94,11 @@ bool reconstructGrid(const std::vector<Triangle>& triangles, Grid& grid) {
 
     grid.z.assign(grid.nrows(), std::vector<float>(grid.ncols(), 0.0f));
 
-    for (const auto& tri : triangles)
+    for (const auto& tri : triangles) {
+        if (computedNz(tri) <= 0.0f) continue;
         for (const auto& v : tri.vertices)
             grid.z[ymap[v.y]][xmap[v.x]] = std::max(grid.z[ymap[v.y]][xmap[v.x]], v.z);
+    }
 
     std::cout << "Grid reconstructed: " << grid.ncols() << " cols x "
               << grid.nrows() << " rows" << std::endl;
@@ -114,8 +132,17 @@ Surface computeOffsetSurface(const Grid& grid, float ball_radius) {
 
     for (int r = 0; r < nr; ++r) {
         for (int c = 0; c < nc; ++c) {
-            float gx = dzdxAt(grid, r, c);
-            float gy = dzdyAt(grid, r, c);
+            float gx, gy;
+            if (grid.z[r][c] < 1e-4f) {
+                // Flat-base terrain: force straight-up normal.
+                // One-sided finite differences at the terrain/base boundary produce
+                // very steep gradients that drive the offset Z nearly to zero,
+                // causing the tool to plunge too deep near workpiece edges.
+                gx = gy = 0.0f;
+            } else {
+                gx = dzdxAt(grid, r, c);
+                gy = dzdyAt(grid, r, c);
+            }
             float nx = -gx, ny = -gy, nz = 1.0f;
             float len = std::sqrt(nx*nx + ny*ny + nz*nz);
             nx /= len;  ny /= len;  nz /= len;
@@ -256,27 +283,33 @@ float bilerp(const std::vector<std::vector<float>>& f, float fc, float fr) {
 
 // --- Lawnmower toolpath generation ----------------------------------------
 // Unidirectional passes: always X+ to X- (climb cutting).
-// Each pass spans from xmax+ball_radius down to xmin-ball_radius.
-// Y steps from ymin-ball_radius to ymax+ball_radius in step_over increments.
-// Z at each point comes from bilinear interpolation of the offset surface;
-// outside the grid the terrain is flat base so Z = ball_radius.
+// stock_*: physical workpiece extents from the STL bounding box (all triangles).
+//   These may be larger than the terrain grid (filtered) if the walls extend
+//   past the topographic surface.  Pass endpoints are stock_edge + ball_radius;
+//   Z lookup is clamped to the terrain grid boundary.
 std::vector<Toolpath> generateLawnmower(const TraceData& td,
                                          float ball_radius, float step_over,
-                                         float step_size) {
+                                         float step_size,
+                                         float stock_xmin, float stock_xmax,
+                                         float stock_ymin, float stock_ymax) {
     const Grid& grid = *td.grid;
-    float xmin = grid.xs.front(), xmax = grid.xs.back();
-    float ymin = grid.ys.front(), ymax = grid.ys.back();
+    // Terrain grid bounds: used for Z lookup only
+    float gxmin = grid.xs.front(), gxmax = grid.xs.back();
+    float gymin = grid.ys.front(), gymax = grid.ys.back();
     float gdx = grid.xs[1] - grid.xs[0];
     float gdy = grid.ys[1] - grid.ys[0];
     int nr = grid.nrows(), nc = grid.ncols();
 
+    // Z from offset surface.  Outside the terrain grid, clamp to the nearest
+    // grid boundary and hold that terrain Z — the wall below the terrain edge
+    // is not topography and must not influence the tool path.
     auto surfZ = [&](float x, float y) -> float {
-        if (x < xmin || x > xmax || y < ymin || y > ymax)
-            return ball_radius;
-        int c = std::clamp((int)((x - xmin) / gdx), 0, nc - 2);
-        int r = std::clamp((int)((y - ymin) / gdy), 0, nr - 2);
-        float tx = (x - grid.xs[c]) / gdx;
-        float ty = (y - grid.ys[r]) / gdy;
+        float cx = std::clamp(x, gxmin, gxmax);
+        float cy = std::clamp(y, gymin, gymax);
+        int c = std::clamp((int)((cx - gxmin) / gdx), 0, nc - 2);
+        int r = std::clamp((int)((cy - gymin) / gdy), 0, nr - 2);
+        float tx = (cx - grid.xs[c]) / gdx;
+        float ty = (cy - grid.ys[r]) / gdy;
         return (1-tx)*(1-ty)*td.surfZ[r  ][c  ]
              +    tx *(1-ty)*td.surfZ[r  ][c+1]
              + (1-tx)*   ty *td.surfZ[r+1][c  ]
@@ -284,11 +317,11 @@ std::vector<Toolpath> generateLawnmower(const TraceData& td,
     };
 
     std::vector<Toolpath> paths;
-    for (float y = ymin - ball_radius;
-         y <= ymax + ball_radius + 1e-5f; y += step_over) {
+    for (float y = stock_ymin - ball_radius;
+         y <= stock_ymax + ball_radius + 1e-5f; y += step_over) {
         Toolpath p;
-        for (float x = xmax + ball_radius;
-             x >= xmin - ball_radius - 1e-5f; x -= step_size)
+        for (float x = stock_xmax + ball_radius;
+             x >= stock_xmin - ball_radius - 1e-5f; x -= step_size)
             p.pts.push_back({x, y, surfZ(x, y)});
         if ((int)p.pts.size() >= 2) paths.push_back(std::move(p));
     }
@@ -373,20 +406,36 @@ int main(int argc, char* argv[]) {
 
     printBoundingBox(triangles);
 
+    // Stock XY bounds from ALL triangles (walls define the true workpiece edge).
+    // These are used for G-code coordinate origin and pass extents.
+    // The terrain grid (built after wall filtering) may be slightly smaller.
+    float stock_xmin =  std::numeric_limits<float>::max();
+    float stock_xmax = -std::numeric_limits<float>::max();
+    float stock_ymin =  std::numeric_limits<float>::max();
+    float stock_ymax = -std::numeric_limits<float>::max();
+    for (const auto& tri : triangles)
+        for (const auto& v : tri.vertices) {
+            stock_xmin = std::min(stock_xmin, v.x);  stock_xmax = std::max(stock_xmax, v.x);
+            stock_ymin = std::min(stock_ymin, v.y);  stock_ymax = std::max(stock_ymax, v.y);
+        }
+    std::cout << "Stock bounds: X " << stock_xmin << " to " << stock_xmax
+              << "  Y " << stock_ymin << " to " << stock_ymax << std::endl;
+
     Grid grid;
     if (!reconstructGrid(triangles, grid))
         return 1;
 
-    const float ball_radius = 0.09375f;  // 3/16" dia ball mill
-    const float step_over   = 0.018f;    // Y increment per pass
-    const float step_size   = 0.010f;    // X resolution per point
-    const float feedrate    = 60.0f;     // ipm
+    const float ball_radius   = 0.09375f;  // 3/16" dia ball mill
+    const float step_over     = 0.018f;    // Y increment per pass
+    const float step_size     = 0.010f;    // X resolution per point
+    const float feedrate      = 60.0f;     // ipm
 
     Surface offset = computeOffsetSurface(grid, ball_radius);
     printSurfaceBounds(offset, grid);
 
     TraceData td = buildTraceData(grid, offset);
-    auto paths = generateLawnmower(td, ball_radius, step_over, step_size);
+    auto paths = generateLawnmower(td, ball_radius, step_over, step_size,
+                                   stock_xmin, stock_xmax, stock_ymin, stock_ymax);
 
     // Z0 = top of part (max offset surface Z); safe_z clears the highest point
     float z_top = 0.0f;
@@ -395,8 +444,8 @@ int main(int argc, char* argv[]) {
             z_top = std::max(z_top, p.z);
     float safe_z = z_top + 0.10f + ball_radius;
 
-    // Y0 = back wall of workpiece
-    float y_max = grid.ys.back();
+    // Y0 = back wall of workpiece (stock_ymax from full bounding box, not terrain grid edge)
+    float y_max = stock_ymax;
 
     const float link_dist = 0.5f;
     writeGCode(paths, "output.nc", feedrate, safe_z, link_dist, y_max, z_top);
