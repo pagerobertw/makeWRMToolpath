@@ -333,7 +333,21 @@ void writeGCode(const std::vector<Toolpath>& paths, const std::string& filename,
     f << std::setprecision(4);
     f << "G0 Z" << fz(safe_z) << "\n";
 
-    int total_pts = 0, nchained = 0;
+    // Skip interior points that are collinear with their neighbors.
+    // Cross product of the two direction vectors is zero iff the three points
+    // are collinear; use a relative tolerance to handle floating-point noise.
+    auto isCollinear = [](const Point& a, const Point& b, const Point& c) -> bool {
+        float d1x = b.x-a.x, d1y = b.y-a.y, d1z = b.z-a.z;
+        float d2x = c.x-b.x, d2y = c.y-b.y, d2z = c.z-b.z;
+        float cx = d1y*d2z - d1z*d2y;
+        float cy = d1z*d2x - d1x*d2z;
+        float cz = d1x*d2y - d1y*d2x;
+        float cross2 = cx*cx + cy*cy + cz*cz;
+        float len2 = (d1x*d1x+d1y*d1y+d1z*d1z) * (d2x*d2x+d2y*d2y+d2z*d2z);
+        return cross2 < 1e-10f * len2;
+    };
+
+    int total_pts = 0, total_suppressed = 0, nchained = 0;
     for (int pi = 0; pi < n; ++pi) {
         const auto& path = paths[pi];
         if (path.pts.empty()) continue;
@@ -347,10 +361,16 @@ void writeGCode(const std::vector<Toolpath>& paths, const std::string& filename,
             f << "G1 Z" << fz(path.pts[0].z) << "\n";
         }
 
-        for (size_t i = 1; i < path.pts.size(); ++i)
+        for (size_t i = 1; i < path.pts.size(); ++i) {
+            if (i < path.pts.size()-1 &&
+                isCollinear(path.pts[i-1], path.pts[i], path.pts[i+1])) {
+                ++total_suppressed;
+                continue;
+            }
             f << "G1 X" << path.pts[i].x
               << " Y"   << fy(path.pts[i].y)
               << " Z"   << fz(path.pts[i].z) << "\n";
+        }
 
         bool next_chains = (pi + 1 < n) && chains[pi + 1];
         if (!next_chains)
@@ -362,7 +382,9 @@ void writeGCode(const std::vector<Toolpath>& paths, const std::string& filename,
     f << "G0 Z" << fz(safe_z) << "\n";
     f << "M30\n";
     std::cout << "Wrote " << filename << " (" << paths.size() << " paths, "
-              << total_pts << " points, " << nchained << " chained)\n";
+              << total_pts << " points, " << total_suppressed << " suppressed, "
+              << (total_pts - total_suppressed) << " emitted, "
+              << nchained << " chained)\n";
 }
 
 // --------------------------------------------------------------------------
