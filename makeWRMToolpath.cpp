@@ -421,6 +421,9 @@ int main(int argc, char* argv[]) {
     std::string inputFile = "RainierPeakReduced.stl";
     if (argc > 1)
         inputFile = argv[1];
+    float angle_deg = 180.0f;
+    if (argc > 2)
+        angle_deg = std::stof(argv[2]);
 
     std::vector<Triangle> triangles;
     if (!readSTL(inputFile, triangles))
@@ -451,7 +454,6 @@ int main(int argc, char* argv[]) {
     const float step_over     = 0.018f;    // stepover between passes
     const float step_size     = 0.010f;    // sample spacing along each pass
     const float feedrate      = 60.0f;     // ipm
-    const float angle_deg     = 180.0f;    // cut direction: 0=+X, 90=+Y, 180=-X
 
     Surface offset = computeOffsetSurface(grid, ball_radius);
     printSurfaceBounds(offset, grid);
