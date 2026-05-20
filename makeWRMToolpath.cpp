@@ -107,49 +107,45 @@ bool reconstructGrid(const std::vector<Triangle>& triangles, Grid& grid) {
 
 // --- Offset surface -------------------------------------------------------
 
-static float dzdxAt(const Grid& g, int r, int c) {
-    if (c == 0)            return (g.z[r][1]   - g.z[r][0])   / (g.xs[1]   - g.xs[0]);
-    if (c == g.ncols()-1)  return (g.z[r][c]   - g.z[r][c-1]) / (g.xs[c]   - g.xs[c-1]);
-    return                        (g.z[r][c+1] - g.z[r][c-1]) / (g.xs[c+1] - g.xs[c-1]);
-}
-
-static float dzdyAt(const Grid& g, int r, int c) {
-    if (r == 0)            return (g.z[1][c]   - g.z[0][c])   / (g.ys[1]   - g.ys[0]);
-    if (r == g.nrows()-1)  return (g.z[r][c]   - g.z[r-1][c]) / (g.ys[r]   - g.ys[r-1]);
-    return                        (g.z[r+1][c] - g.z[r-1][c]) / (g.ys[r+1] - g.ys[r-1]);
-}
-
 struct Surface {
     int rows, cols;
     std::vector<std::vector<Point>> pts;
 };
 
+// Correct ball-mill offset surface: for each grid point (xi,yi), find the
+// maximum safe ball-center Z by checking all terrain points within ball_radius.
+// Z_offset = max over neighbors j of: z_j + sqrt(r^2 - dx^2 - dy^2)
+// This is a 2D morphological dilation with a spherical structuring element.
+// The local-normal approach is incorrect in concave terrain (craters, valleys)
+// because it ignores neighboring terrain that would be gouged.
 Surface computeOffsetSurface(const Grid& grid, float ball_radius) {
     int nr = grid.nrows(), nc = grid.ncols();
+    float gdx = grid.xs[1] - grid.xs[0];
+    float gdy = grid.ys[1] - grid.ys[0];
+    int dc = (int)std::ceil(ball_radius / gdx) + 1;
+    int dr = (int)std::ceil(ball_radius / gdy) + 1;
+    float r2 = ball_radius * ball_radius;
+
     Surface s;
-    s.rows = nr;  s.cols = nc;
+    s.rows = nr; s.cols = nc;
     s.pts.assign(nr, std::vector<Point>(nc));
 
-    for (int r = 0; r < nr; ++r) {
-        for (int c = 0; c < nc; ++c) {
-            float gx, gy;
-            if (grid.z[r][c] < 1e-4f) {
-                // Flat-base terrain: force straight-up normal.
-                // One-sided finite differences at the terrain/base boundary produce
-                // very steep gradients that drive the offset Z nearly to zero,
-                // causing the tool to plunge too deep near workpiece edges.
-                gx = gy = 0.0f;
-            } else {
-                gx = dzdxAt(grid, r, c);
-                gy = dzdyAt(grid, r, c);
+    for (int ri = 0; ri < nr; ++ri) {
+        for (int ci = 0; ci < nc; ++ci) {
+            float xi = grid.xs[ci], yi = grid.ys[ri];
+            float z_max = -std::numeric_limits<float>::max();
+            for (int rj = std::max(0, ri-dr); rj <= std::min(nr-1, ri+dr); ++rj) {
+                float ddy = yi - grid.ys[rj]; ddy *= ddy;
+                if (ddy > r2) continue;
+                for (int cj = std::max(0, ci-dc); cj <= std::min(nc-1, ci+dc); ++cj) {
+                    float ddx = xi - grid.xs[cj];
+                    float d2 = ddx*ddx + ddy;
+                    if (d2 > r2) continue;
+                    float zb = grid.z[rj][cj] + std::sqrt(r2 - d2);
+                    if (zb > z_max) z_max = zb;
+                }
             }
-            float nx = -gx, ny = -gy, nz = 1.0f;
-            float len = std::sqrt(nx*nx + ny*ny + nz*nz);
-            nx /= len;  ny /= len;  nz /= len;
-
-            s.pts[r][c] = { grid.xs[c] + nx * ball_radius,
-                            grid.ys[r] + ny * ball_radius,
-                            grid.z[r][c] + nz * ball_radius };
+            s.pts[ri][ci] = {xi, yi, z_max};
         }
     }
     return s;
@@ -209,8 +205,6 @@ struct Toolpath {
 struct TraceData {
     const Grid* grid;
     std::vector<std::vector<float>> surfZ;  // offset surface Z at each grid point
-    std::vector<std::vector<float>> gx;     // dZ/dX on offset surface
-    std::vector<std::vector<float>> gy;     // dZ/dY on offset surface
 };
 
 TraceData buildTraceData(const Grid& grid, const Surface& surf) {
@@ -218,30 +212,9 @@ TraceData buildTraceData(const Grid& grid, const Surface& surf) {
     TraceData td;
     td.grid = &grid;
     td.surfZ.assign(nr, std::vector<float>(nc));
-    td.gx.assign(nr, std::vector<float>(nc, 0.0f));
-    td.gy.assign(nr, std::vector<float>(nc, 0.0f));
-
     for (int r = 0; r < nr; ++r)
         for (int c = 0; c < nc; ++c)
             td.surfZ[r][c] = surf.pts[r][c].z;
-
-    for (int r = 0; r < nr; ++r) {
-        for (int c = 0; c < nc; ++c) {
-            if (c == 0)
-                td.gx[r][c] = (td.surfZ[r][1]   - td.surfZ[r][0])   / (grid.xs[1]   - grid.xs[0]);
-            else if (c == nc-1)
-                td.gx[r][c] = (td.surfZ[r][c]   - td.surfZ[r][c-1]) / (grid.xs[c]   - grid.xs[c-1]);
-            else
-                td.gx[r][c] = (td.surfZ[r][c+1] - td.surfZ[r][c-1]) / (grid.xs[c+1] - grid.xs[c-1]);
-
-            if (r == 0)
-                td.gy[r][c] = (td.surfZ[1][c]   - td.surfZ[0][c])   / (grid.ys[1]   - grid.ys[0]);
-            else if (r == nr-1)
-                td.gy[r][c] = (td.surfZ[r][c]   - td.surfZ[r-1][c]) / (grid.ys[r]   - grid.ys[r-1]);
-            else
-                td.gy[r][c] = (td.surfZ[r+1][c] - td.surfZ[r-1][c]) / (grid.ys[r+1] - grid.ys[r-1]);
-        }
-    }
     return td;
 }
 
