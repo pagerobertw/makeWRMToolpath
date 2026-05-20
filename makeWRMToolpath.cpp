@@ -255,18 +255,41 @@ float bilerp(const std::vector<std::vector<float>>& f, float fc, float fr) {
 }
 
 // --- Lawnmower toolpath generation ----------------------------------------
-// Unidirectional passes: always X+ to X- (climb cutting).
-// stock_*: physical workpiece extents from the STL bounding box (all triangles).
-//   These may be larger than the terrain grid (filtered) if the walls extend
-//   past the topographic surface.  Pass endpoints are stock_edge + ball_radius;
+// Unidirectional passes at an arbitrary angle (climb cutting).
+//   angle_deg: direction of each cut pass in degrees, standard math convention:
+//     0   = cut toward +X (east)
+//     90  = cut toward +Y (north)
+//     180 = cut toward -X (west)  ← original behavior
+// The stepover direction is 90° clockwise from the cut direction, which
+// maintains climb cutting for any angle.
+// stock_*: physical workpiece extents (all triangles, walls included).
+//   Pass endpoints extend ball_radius beyond the stock edge in both axes.
 //   Z lookup is clamped to the terrain grid boundary.
 std::vector<Toolpath> generateLawnmower(const TraceData& td,
                                          float ball_radius, float step_over,
-                                         float step_size,
+                                         float step_size, float angle_deg,
                                          float stock_xmin, float stock_xmax,
                                          float stock_ymin, float stock_ymax) {
+    const float deg2rad = 3.14159265358979f / 180.0f;
+    float theta = angle_deg * deg2rad;
+    float cdx = std::cos(theta),  cdy = std::sin(theta);   // cut direction unit vector
+    float sdx = std::sin(theta),  sdy = -std::cos(theta);  // step direction (90° CW from cut)
+
+    // Project all four stock corners onto cut and step axes to find sweep extents.
+    float cut_min =  std::numeric_limits<float>::max();
+    float cut_max = -std::numeric_limits<float>::max();
+    float step_min =  std::numeric_limits<float>::max();
+    float step_max = -std::numeric_limits<float>::max();
+    for (float cx : {stock_xmin, stock_xmax}) {
+        for (float cy : {stock_ymin, stock_ymax}) {
+            float cp = cx*cdx + cy*cdy;
+            float sp = cx*sdx + cy*sdy;
+            cut_min  = std::min(cut_min,  cp);  cut_max  = std::max(cut_max,  cp);
+            step_min = std::min(step_min, sp);  step_max = std::max(step_max, sp);
+        }
+    }
+
     const Grid& grid = *td.grid;
-    // Terrain grid bounds: used for Z lookup only
     float gxmin = grid.xs.front(), gxmax = grid.xs.back();
     float gymin = grid.ys.front(), gymax = grid.ys.back();
     float gdx = grid.xs[1] - grid.xs[0];
@@ -274,8 +297,7 @@ std::vector<Toolpath> generateLawnmower(const TraceData& td,
     int nr = grid.nrows(), nc = grid.ncols();
 
     // Z from offset surface.  Outside the terrain grid, clamp to the nearest
-    // grid boundary and hold that terrain Z — the wall below the terrain edge
-    // is not topography and must not influence the tool path.
+    // grid boundary and hold that terrain Z.
     auto surfZ = [&](float x, float y) -> float {
         float cx = std::clamp(x, gxmin, gxmax);
         float cy = std::clamp(y, gymin, gymax);
@@ -289,16 +311,21 @@ std::vector<Toolpath> generateLawnmower(const TraceData& td,
              +    tx *   ty *td.surfZ[r+1][c+1];
     };
 
+    // Each pass: fixed step position s, cut parameter t sweeps the full cut range.
+    // World position: (x,y) = s*(sdx,sdy) + t*(cdx,cdy)
     std::vector<Toolpath> paths;
-    for (float y = stock_ymin - ball_radius;
-         y <= stock_ymax + ball_radius + 1e-5f; y += step_over) {
+    for (float s = step_min - ball_radius;
+         s <= step_max + ball_radius + 1e-5f; s += step_over) {
         Toolpath p;
-        for (float x = stock_xmax + ball_radius;
-             x >= stock_xmin - ball_radius - 1e-5f; x -= step_size)
+        for (float t = cut_min - ball_radius;
+             t <= cut_max + ball_radius + 1e-5f; t += step_size) {
+            float x = s*sdx + t*cdx;
+            float y = s*sdy + t*cdy;
             p.pts.push_back({x, y, surfZ(x, y)});
+        }
         if ((int)p.pts.size() >= 2) paths.push_back(std::move(p));
     }
-    std::cout << "Lawnmower: " << paths.size() << " passes\n";
+    std::cout << "Lawnmower(" << angle_deg << " deg): " << paths.size() << " passes\n";
     return paths;
 }
 
@@ -421,15 +448,16 @@ int main(int argc, char* argv[]) {
         return 1;
 
     const float ball_radius   = 0.09375f;  // 3/16" dia ball mill
-    const float step_over     = 0.018f;    // Y increment per pass
-    const float step_size     = 0.010f;    // X resolution per point
+    const float step_over     = 0.018f;    // stepover between passes
+    const float step_size     = 0.010f;    // sample spacing along each pass
     const float feedrate      = 60.0f;     // ipm
+    const float angle_deg     = 180.0f;    // cut direction: 0=+X, 90=+Y, 180=-X
 
     Surface offset = computeOffsetSurface(grid, ball_radius);
     printSurfaceBounds(offset, grid);
 
     TraceData td = buildTraceData(grid, offset);
-    auto paths = generateLawnmower(td, ball_radius, step_over, step_size,
+    auto paths = generateLawnmower(td, ball_radius, step_over, step_size, angle_deg,
                                    stock_xmin, stock_xmax, stock_ymin, stock_ymax);
 
     // Z0 = top of part (max offset surface Z); safe_z clears the highest point
