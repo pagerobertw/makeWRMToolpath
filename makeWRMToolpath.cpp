@@ -421,9 +421,11 @@ int main(int argc, char* argv[]) {
     std::string inputFile = "RainierPeakReduced.stl";
     if (argc > 1)
         inputFile = argv[1];
-    float angle_deg = 180.0f;
-    if (argc > 2)
-        angle_deg = std::stof(argv[2]);
+    float angle_deg  = 180.0f;   if (argc > 2) angle_deg  = std::stof(argv[2]);
+    float ball_radius = 0.09375f; if (argc > 3) ball_radius = std::stof(argv[3]);
+    float step_over   = 0.018f;  if (argc > 4) step_over   = std::stof(argv[4]);
+    float step_size   = 0.010f;  if (argc > 5) step_size   = std::stof(argv[5]);
+    float feedrate    = 60.0f;   if (argc > 6) feedrate    = std::stof(argv[6]);
 
     std::vector<Triangle> triangles;
     if (!readSTL(inputFile, triangles))
@@ -450,10 +452,9 @@ int main(int argc, char* argv[]) {
     if (!reconstructGrid(triangles, grid))
         return 1;
 
-    const float ball_radius   = 0.09375f;  // 3/16" dia ball mill
-    const float step_over     = 0.018f;    // stepover between passes
-    const float step_size     = 0.010f;    // sample spacing along each pass
-    const float feedrate      = 60.0f;     // ipm
+    std::cout << "Parameters: angle=" << angle_deg << " ball_radius=" << ball_radius
+              << " step_over=" << step_over << " step_size=" << step_size
+              << " feedrate=" << feedrate << std::endl;
 
     Surface offset = computeOffsetSurface(grid, ball_radius);
     printSurfaceBounds(offset, grid);
