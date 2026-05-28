@@ -275,19 +275,20 @@ std::vector<Toolpath> generateLawnmower(const TraceData& td,
     float cdx = std::cos(theta),  cdy = std::sin(theta);   // cut direction unit vector
     float sdx = std::sin(theta),  sdy = -std::cos(theta);  // step direction (90° CW from cut)
 
-    // Project all four stock corners onto cut and step axes to find sweep extents.
-    float cut_min =  std::numeric_limits<float>::max();
-    float cut_max = -std::numeric_limits<float>::max();
+    // Project all four stock corners onto the step axis to find the step sweep range.
+    // (Cut extents are computed per-pass below by intersecting with the bounding box.)
     float step_min =  std::numeric_limits<float>::max();
     float step_max = -std::numeric_limits<float>::max();
     for (float cx : {stock_xmin, stock_xmax}) {
         for (float cy : {stock_ymin, stock_ymax}) {
-            float cp = cx*cdx + cy*cdy;
             float sp = cx*sdx + cy*sdy;
-            cut_min  = std::min(cut_min,  cp);  cut_max  = std::max(cut_max,  cp);
             step_min = std::min(step_min, sp);  step_max = std::max(step_max, sp);
         }
     }
+
+    // Expanded bounding box: stock + ball_radius on all sides.
+    float xb_min = stock_xmin - ball_radius, xb_max = stock_xmax + ball_radius;
+    float yb_min = stock_ymin - ball_radius, yb_max = stock_ymax + ball_radius;
 
     const Grid& grid = *td.grid;
     float gxmin = grid.xs.front(), gxmax = grid.xs.back();
@@ -311,14 +312,31 @@ std::vector<Toolpath> generateLawnmower(const TraceData& td,
              +    tx *   ty *td.surfZ[r+1][c+1];
     };
 
-    // Each pass: fixed step position s, cut parameter t sweeps the full cut range.
-    // World position: (x,y) = s*(sdx,sdy) + t*(cdx,cdy)
+    // Each pass: fixed step position s, t sweeps from where the pass enters the
+    // expanded box to where it exits.  World position: (x,y) = s*(sdx,sdy) + t*(cdx,cdy)
     std::vector<Toolpath> paths;
     for (float s = step_min - ball_radius;
          s <= step_max + ball_radius + 1e-5f; s += step_over) {
+        // Intersect the pass line with the expanded bounding box.
+        float t_lo = -1e30f, t_hi = 1e30f;
+        if (std::abs(cdx) > 1e-6f) {
+            float ta = (xb_min - s*sdx) / cdx;
+            float tb = (xb_max - s*sdx) / cdx;
+            if (ta > tb) std::swap(ta, tb);
+            t_lo = std::max(t_lo, ta);
+            t_hi = std::min(t_hi, tb);
+        }
+        if (std::abs(cdy) > 1e-6f) {
+            float ta = (yb_min - s*sdy) / cdy;
+            float tb = (yb_max - s*sdy) / cdy;
+            if (ta > tb) std::swap(ta, tb);
+            t_lo = std::max(t_lo, ta);
+            t_hi = std::min(t_hi, tb);
+        }
+        if (t_lo >= t_hi) continue;
+
         Toolpath p;
-        for (float t = cut_min - ball_radius;
-             t <= cut_max + ball_radius + 1e-5f; t += step_size) {
+        for (float t = t_lo; t <= t_hi + 1e-5f; t += step_size) {
             float x = s*sdx + t*cdx;
             float y = s*sdy + t*cdy;
             p.pts.push_back({x, y, surfZ(x, y)});
